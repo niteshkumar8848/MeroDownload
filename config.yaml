@@ -1,0 +1,10 @@
+download_folder: ~/Downloads/MeroDownload
+max_concurrent: 2
+default_format: mp4
+default_quality: 1080p
+bandwidth_limit: 0
+proxy: ""
+cookie_file: ""
+notifications: true
+theme: light
+embed_subtitles: false
