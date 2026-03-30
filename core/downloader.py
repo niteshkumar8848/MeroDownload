@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,6 +66,7 @@ class MeroDownloader(QObject):
         self.db = database
         self.config = config
         self.download_folder = ensure_folder(config["download_folder"])
+        self._aria2c_path = shutil.which("aria2c")
         self.executor = ThreadPoolExecutor(max_workers=int(config.get("max_concurrent", 2)))
         self.lock = threading.Lock()
         self.tasks: dict[int, DownloadTask] = {}
@@ -242,6 +245,8 @@ class MeroDownloader(QObject):
         self.task_updated.emit(self._to_payload(task))
         self._emit_stats()
 
+        progress_state: dict[str, int | bool] = {"downloaded": 0, "total": 0, "exact_total": False}
+
         def hook(data: dict[str, Any]) -> None:
             if task.control.remove_requested:
                 raise DownloadError("Removed by user")
@@ -251,7 +256,14 @@ class MeroDownloader(QObject):
             status = data.get("status")
             if status == "downloading":
                 downloaded = data.get("downloaded_bytes") or 0
-                total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                total_exact = data.get("total_bytes") or 0
+                total_est = data.get("total_bytes_estimate") or 0
+                total = total_exact or total_est
+                progress_state["downloaded"] = int(downloaded or progress_state["downloaded"])
+                if total:
+                    progress_state["total"] = int(total)
+                if total_exact:
+                    progress_state["exact_total"] = True
                 percent = (downloaded / total * 100) if total else 0
                 task.progress = min(percent, 100)
                 task.speed = format_speed(data.get("speed"))
@@ -265,22 +277,53 @@ class MeroDownloader(QObject):
                 task.speed = "--"
                 self.task_updated.emit(self._to_payload(task))
 
-        options = self._build_ydl_options(task, hook)
-
         try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(task.url, download=True)
-                requested = info.get("requested_downloads") or []
-                if requested:
-                    task.filepath = requested[0].get("filepath") or task.filepath
-                task.title = info.get("title") or task.title
-                task.thumbnail_url = info.get("thumbnail") or task.thumbnail_url
-                task.duration = int(info.get("duration") or task.duration or 0)
-                if not task.size_bytes:
-                    est_size = info.get("filesize") or info.get("filesize_approx") or 0
-                    if est_size:
-                        task.size_bytes = int(est_size)
-                        task.size_text = format_bytes(task.size_bytes)
+            info = {}
+            attempts = [
+                ("Primary", self._build_ydl_options(task, hook, use_external=True, compatibility=False, force_best=False)),
+                ("Compatibility", self._build_ydl_options(task, hook, use_external=False, compatibility=True, force_best=False)),
+                ("Fallback Best", self._build_ydl_options(task, hook, use_external=False, compatibility=True, force_best=True)),
+            ]
+            last_error = "Unknown download error"
+            success = False
+
+            for idx, (_, options) in enumerate(attempts):
+                try:
+                    with YoutubeDL(options) as ydl:
+                        info = ydl.extract_info(task.url, download=True)
+                        requested = info.get("requested_downloads") or []
+                        if requested:
+                            task.filepath = requested[0].get("filepath") or task.filepath
+                        if not task.filepath:
+                            task.filepath = ydl.prepare_filename(info)
+
+                        task.title = info.get("title") or task.title
+                        task.thumbnail_url = info.get("thumbnail") or task.thumbnail_url
+                        task.duration = int(info.get("duration") or task.duration or 0)
+                        if not task.size_bytes:
+                            est_size = info.get("filesize") or info.get("filesize_approx") or 0
+                            if est_size:
+                                task.size_bytes = int(est_size)
+                                task.size_text = format_bytes(task.size_bytes)
+
+                    self._validate_completed_file(task, info, progress_state)
+                    success = True
+                    break
+                except DownloadError as exc:
+                    msg = str(exc)
+                    if "Paused by user" in msg or "Removed by user" in msg:
+                        raise
+                    last_error = msg
+                    if idx == len(attempts) - 1:
+                        raise DownloadError(last_error) from exc
+                except Exception as exc:  # noqa: BLE001
+                    last_error = str(exc)
+                    if idx == len(attempts) - 1:
+                        raise DownloadError(last_error) from exc
+
+            if not success:
+                raise DownloadError(last_error)
+
             if task.control.remove_requested:
                 raise DownloadError("Removed by user")
             if task.control.pause_requested:
@@ -342,7 +385,42 @@ class MeroDownloader(QObject):
         self.history_changed.emit()
         self._emit_stats()
 
-    def _build_ydl_options(self, task: DownloadTask, hook) -> dict[str, Any]:
+    def _validate_completed_file(
+        self,
+        task: DownloadTask,
+        info: dict[str, Any],
+        progress_state: dict[str, int | bool],
+    ) -> None:
+        if not task.filepath:
+            return
+        path = Path(task.filepath)
+        if not path.exists():
+            raise DownloadError("Download ended but output file is missing")
+
+        actual_size = path.stat().st_size
+        expected_size = 0
+        if progress_state.get("exact_total"):
+            expected_size = int(progress_state.get("total") or 0)
+        elif info.get("filesize"):
+            expected_size = int(info.get("filesize") or 0)
+        if expected_size <= 0:
+            return
+
+        minimum_acceptable = int(expected_size * 0.85)
+        if actual_size < minimum_acceptable:
+            raise DownloadError(
+                f"Incomplete download detected ({format_bytes(actual_size)} of {format_bytes(expected_size)})"
+            )
+
+    def _build_ydl_options(
+        self,
+        task: DownloadTask,
+        hook,
+        *,
+        use_external: bool,
+        compatibility: bool,
+        force_best: bool,
+    ) -> dict[str, Any]:
         ext = task.fmt.lower()
         base_name = sanitize_filename(task.title or "video")
         outtmpl = os.path.join(self.download_folder, f"{base_name}.%(ext)s")
@@ -353,12 +431,39 @@ class MeroDownloader(QObject):
             "no_warnings": True,
             "noplaylist": True,
             "continuedl": True,
+            "overwrites": True,
             "progress_hooks": [hook],
             "merge_output_format": "mp4",
             "proxy": self.config.get("proxy") or None,
             "cookiefile": self.config.get("cookie_file") or None,
             "ratelimit": int(self.config.get("bandwidth_limit", 0)) * 1024 or None,
+            "retries": 8 if compatibility else 12,
+            "fragment_retries": 12 if compatibility else 20,
+            "extractor_retries": 5,
+            "file_access_retries": 3,
+            "concurrent_fragment_downloads": 4 if compatibility else 8,
+            "skip_unavailable_fragments": compatibility,
+            "hls_prefer_native": False,
+            "http_chunk_size": 0,
+            "socket_timeout": 30,
         }
+
+        if use_external and self._aria2c_path:
+            opts["external_downloader"] = "aria2c"
+            opts["external_downloader_args"] = [
+                "-c",
+                "-j",
+                "4",
+                "-x",
+                "16",
+                "-s",
+                "16",
+                "-k",
+                "1M",
+                "--file-allocation=none",
+                "--summary-interval=0",
+                "--console-log-level=warn",
+            ]
 
         quality_map = {
             "360p": 360,
@@ -387,19 +492,33 @@ class MeroDownloader(QObject):
                         "preferredcodec": "m4a",
                     }
                 ]
+        elif force_best and ext == "webm":
+            opts["format"] = "best[ext=webm]/best"
+            opts["merge_output_format"] = "webm"
+        elif force_best:
+            opts["format"] = "best[ext=mp4]/best"
         elif ext == "webm":
             height = quality_map.get(task.quality)
             if height:
-                opts["format"] = f"bestvideo[ext=webm][height<={height}]+bestaudio[ext=webm]/best[ext=webm]"
+                opts["format"] = (
+                    f"best[ext=webm][height<={height}]/"
+                    f"bestvideo[ext=webm][height<={height}]+bestaudio[ext=webm]/best[ext=webm]"
+                )
             else:
-                opts["format"] = "bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]"
+                opts["format"] = (
+                    "best[ext=webm]/"
+                    "bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]"
+                )
             opts["merge_output_format"] = "webm"
         else:
             height = quality_map.get(task.quality)
             if height:
-                opts["format"] = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+                opts["format"] = (
+                    f"best[height<={height}]/"
+                    f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+                )
             else:
-                opts["format"] = "bestvideo+bestaudio/best"
+                opts["format"] = "best/bestvideo+bestaudio/best"
 
         if task.embed_subtitles:
             opts["writesubtitles"] = True

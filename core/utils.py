@@ -15,7 +15,7 @@ DEFAULT_CONFIG = {
     "proxy": "",
     "cookie_file": "",
     "notifications": True,
-    "theme": "light",
+    "theme": "dark",
     "embed_subtitles": False,
 }
 
@@ -33,6 +33,8 @@ def load_config(path: str) -> dict[str, Any]:
         data = yaml.safe_load(f) or {}
     cfg = DEFAULT_CONFIG.copy()
     cfg.update(data)
+    # App is intentionally dark-only.
+    cfg["theme"] = "dark"
     return cfg
 
 

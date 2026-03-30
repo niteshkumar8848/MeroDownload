@@ -187,3 +187,5 @@ build/
 # Assets (if generated)
 assets/generated/
 
+TODO.md
+.codex

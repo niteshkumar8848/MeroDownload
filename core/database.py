@@ -98,7 +98,7 @@ class DatabaseManager:
             return
         self.update_download(download_id, fields)
 
-    def get_history(self, search: str = "", sort_by: str = "Date") -> list[dict[str, Any]]:
+    def get_history(self, search: str = "", sort_by: str = "Date", media_filter: str = "all") -> list[dict[str, Any]]:
         sort_map = {
             "Date": "COALESCE(completed_at, added_at) DESC",
             "Size": "size_bytes DESC",
@@ -107,6 +107,10 @@ class DatabaseManager:
         order = sort_map.get(sort_by, sort_map["Date"])
         query = "SELECT * FROM downloads WHERE status = 'COMPLETED'"
         params: list[Any] = []
+        if media_filter == "audio":
+            query += " AND LOWER(format) IN ('mp3', 'm4a')"
+        elif media_filter == "video":
+            query += " AND (format IS NULL OR LOWER(format) NOT IN ('mp3', 'm4a'))"
         if search:
             query += " AND title LIKE ?"
             params.append(f"%{search}%")
